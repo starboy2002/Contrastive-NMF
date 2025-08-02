@@ -1,71 +1,107 @@
+import os
 import numpy as np
-from trf.trf_model import build_design_matrix, train_trf, predict_trf
-from cnmf.contrastive_NMF import contrastive_NMF
+import librosa
+from glob import glob
+from sklearn.decomposition import NMF
+from trf import build_design_matrix
+from train_contrastive_nmf import train_contrastive_nmf_with_trf
+from torchmetrics.audio import ScaleInvariantSignalDistortionRatio
+import torch
+
+# ========== 路径配置 ==========
+data_root = r"E:\Projects\AI_Music\Neuro_Music\processed_data_MADEEEG"
+eeg_dir = os.path.join(data_root, "response_npy")
+solo_dir = os.path.join(data_root, "isolated_wav")
+mix_dir = os.path.join(data_root, "stimulus_wav")
+
+# ========== 遍历处理每个样本 ==========
+eeg_files = sorted(glob(os.path.join(eeg_dir, "*_response.npy")))
+
+for eeg_path in eeg_files:
+    basename = os.path.basename(eeg_path).replace("_response.npy", "")
+    solo_path = os.path.join(solo_dir, f"{basename}_soli.wav")
+    mix_path = os.path.join(mix_dir, f"{basename}_stimulus.wav")
+
+    if not os.path.exists(solo_path) or not os.path.exists(mix_path):
+        print(f"[WARNING] Missing audio for {basename}, skipping.")
+        continue
+
+    print("\n[INFO] Processing:", basename)
+    print("[INFO] EEG:", eeg_path)
+    print("[INFO] SOLO:", solo_path)
+    print("[INFO] MIXED:", mix_path)
+
+    # ========== 加载数据 ==========
+    eeg = np.load(eeg_path)  # shape: [C, T]
+    y_solo, sr = librosa.load(solo_path, sr=None)
+    y_mix, _ = librosa.load(mix_path, sr=sr)
+
+    # ========== Step 1: 提取 H_target ==========
+    S_solo = librosa.stft(y_solo, n_fft=1024, hop_length=512)
+    V_solo = np.abs(S_solo)
+    nmf = NMF(n_components=16, init='random', solver='mu', beta_loss='kullback-leibler', max_iter=200)
+    W_solo = nmf.fit_transform(V_solo)
+    H_target = nmf.components_  # shape: [K, T]
+
+    # ========== Step 2: 构造 EEG 延迟特征 ==========
+    lags = list(range(0, 65))
+    R = build_design_matrix(eeg, lags)
+    T = min(R.shape[1], H_target.shape[1])
+    R = R[:, :T]
+    H_target = H_target[:, :T]
+
+    # ========== Step 3: 混音音频 STFT ==========
+    S_mix = librosa.stft(y_mix, n_fft=1024, hop_length=512)
+    V_mix = np.abs(S_mix)
+    phase_mix = np.angle(S_mix)
+    F, T = V_mix.shape
+    K = 32
+
+    # ========== Step 4: 初始化 W, H ==========
+    # w_init = np.abs(np.random.rand(F, K))
+    # h_init = np.abs(np.random.rand(K, T))
+
+    nmf_init = NMF(n_components=K, init='random', solver='mu', beta_loss='kullback-leibler', max_iter=200)
+    w_init = nmf_init.fit_transform(V_mix)
+    h_init = nmf_init.components_
 
 
-def train_contrastive_nmf_with_trf(
-    eeg_train,
-    audio_mix_mag,
-    h_target,
-    w_init,
-    h_init,
-    lags=list(range(0, 65)),
-    delta=1000,
-    mu=1,
-    beta=1,
-    alpha=0.1,
-    outer_iter=3,
-    inner_iter=100,
-    nr_src=2,
-):
-    """
-    完整复现伪代码的双层循环：外层更新 TRF，内层运行 Contrastive-NMF
+    # ========== Step 5: 外层 TRF + NMF 双循环训练 ==========
+    w_final, h_final, h_tilde = train_contrastive_nmf_with_trf(
+        eeg_train=eeg,
+        audio_mix_mag=V_mix,
+        h_target=H_target,
+        w_init=w_init,
+        h_init=h_init,
+        lags=lags,
+        delta=10000,
+        mu=10,
+        beta=10,
+        alpha=0.1,
+        outer_iter=10,
+        inner_iter=400,
+        nr_src=2
+    )
 
-    参数：
-    - eeg_train: np.array (C, T), EEG 训练数据
-    - audio_mix_mag: np.array (F, T), 混音音频的幅度谱
-    - h_target: np.array (K, T), 目标 source 的 NMF 激活（用于训练 TRF）
-    - w_init: np.array (F, K), W 初始化
-    - h_init: np.array (K, T), H 初始化
-    - lags: list of int, EEG 延迟
-    - delta, mu, beta: Contrastive-NMF 参数
-    - alpha: TRF 正则化
-    - outer_iter: 外层循环次数（TRF + NMF）
-    - inner_iter: 每轮 Contrastive-NMF 的迭代次数
-    - nr_src: 源数量
+    # ========== Step 6: 重建音频 ==========
+    Lambda = np.dot(w_final, h_final)
+    mask = (np.dot(w_final[:, :K//2], h_final[:K//2, :])) / (Lambda + 1e-9)
+    S_hat = mask * S_mix
+    y_hat = librosa.istft(S_hat)
 
-    返回：最终的 W, H, h_tilde
-    """
-    print("[INFO] Start dual-loop training...")
+    # ========== Step 7: SISDR 评估 ==========
+    min_len = min(len(y_hat), len(y_solo))
+    y_hat = y_hat[:min_len]
+    y_solo = y_solo[:min_len]
+    sisdr = ScaleInvariantSignalDistortionRatio()
+    score = sisdr(torch.tensor(y_hat), torch.tensor(y_solo))
+    print(f"[RESULT] SI-SDR for {basename}: {score.item():.2f} dB")
 
-    R = build_design_matrix(eeg_train, lags)
-    g, scaler = train_trf(R, h_target, alpha=alpha)
+    # ========== Step 8: 保存重建音频 ==========
+    import soundfile as sf
+    output_dir = "reconstructed_audio"
+    os.makedirs(output_dir, exist_ok=True)
 
-    w = w_init.copy()
-    h = h_init.copy()
-
-    for epoch in range(outer_iter):
-        print(f"[INFO] Outer loop {epoch+1}/{outer_iter}...")
-
-        # Step 1: 预测 Sa（h_tilde）
-        R = build_design_matrix(eeg_train, lags)
-        h_tilde = predict_trf(R, g, scaler)
-
-        # Step 2: Contrastive NMF（固定 g）
-        w, h, cost = contrastive_NMF(
-            v=audio_mix_mag,
-            w_init=w,
-            h_init=h,
-            h_tilde=h_tilde,
-            delta=delta,
-            mu=mu,
-            beta=beta,
-            n_iter=inner_iter,
-            nr_src=nr_src,
-        )
-
-        # Step 3: 更新 TRF（update g）
-        g, scaler = train_trf(R, h, alpha=alpha)
-
-    print("[INFO] Training complete.")
-    return w, h, h_tilde
+    out_path = os.path.join(output_dir, f"{basename}_estimate.wav")
+    sf.write(out_path, y_hat, samplerate=sr, subtype='PCM_16')
+    print(f"[INFO] Saved estimated audio to {out_path}")
